@@ -14,13 +14,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/EinsumsMacros.cmake")
 # Find the installation root.
 get_filename_component(_einsums_root_dir "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 
-list(APPEND CMAKE_PREFIX_PATH "${_einsums_root_dir}/lib")
-
-# include external targets
-include("${CMAKE_CURRENT_LIST_DIR}/EinsumsH5cppTarget.cmake")
-# include exported targets
-include("${CMAKE_CURRENT_LIST_DIR}/einsums_internal_targets.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/EinsumsTargets.cmake")
+list(APPEND CMAKE_PREFIX_PATH "${_einsums_root_dir}")
 
 einsums_set_cmake_policy(CMP0144 NEW)
 
@@ -59,6 +53,7 @@ set(EINSUMS_CXX_COMPILER_VERSION
     CACHE STRING "CXX compiler version for einsums" FORCE
 )
 
+# Find dependencies BEFORE including targets that reference them
 einsums_find_package(fmt 11 REQUIRED)
 einsums_find_package(argparse 3 REQUIRED)
 einsums_find_package(spdlog 1 REQUIRED)
@@ -125,6 +120,11 @@ if (NOT EINSUMS_CMAKE_LOGLEVEL)
 endif ()
 
 einsums_check_compiler_compatibility()
+
+# Include targets AFTER all dependencies have been found
+include("${CMAKE_CURRENT_LIST_DIR}/EinsumsH5cppTarget.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/einsums_internal_targets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/EinsumsTargets.cmake")
 
 # Since we offer Einsums::Einsums, Einsums::EinsumsPy, and Einsums::EinsumsExperimental
 # we need to let the user ask for COMPONENTS and then ensure we have everything needed

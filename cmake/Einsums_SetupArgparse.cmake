@@ -5,10 +5,13 @@
 
 include(FetchContent)
 
+# Set options for argparse before fetching
+set(ARGPARSE_INSTALL ON CACHE BOOL "Enable argparse installation" FORCE)
+
 fetchcontent_declare(
   argparse
   GIT_REPOSITORY https://github.com/Einsums/argparse.git
-  FIND_PACKAGE_ARGS
-  3
+  GIT_TAG master
+  OVERRIDE_FIND_PACKAGE
 )
 fetchcontent_makeavailable(argparse)
