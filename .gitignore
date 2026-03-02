@@ -85,3 +85,4 @@ conda.yml
 build.sh
 install
 .opencode
+install_p4qca
