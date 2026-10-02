@@ -470,6 +470,79 @@ bool stream_run_ok(T const *dst, int64_t n) {
     }
 }
 
+/// @brief The plan with every M and N dim but one moved into the batch, when that
+/// makes the contraction a stack of plain vendor GEMMs.
+///
+/// A target index that only one operand carries need not be a GEMM row or
+/// column: it is equally a batch index along which the other operand does not
+/// move, i.e. has batch stride 0.  "mcy <- mby ; bc" is the case that matters -
+/// one small GEMM per y against the same B - and as a two-dim M group (m, y) it
+/// can only go to the scatter-packed kernels, which ran it 3-4x slower than a
+/// loop of vendor GEMMs.  Promoted, it is gemm_batch.
+///
+/// Returns false, leaving @p out untouched, unless the result is single-K,
+/// single-M, single-N and has the strides blis_contraction's gemm_batch fast
+/// path takes; so a promoted plan is only ever used on that path.
+inline bool batch_promoted_plan(PackingPlan const &plan, PackingPlan &out) {
+    if (plan.synthetic || plan.swap_ab || plan.k_dims_in_a.size() != 1 || plan.m_dims.empty() || plan.n_dims.empty() ||
+        (plan.m_dims.size() < 2 && plan.n_dims.size() < 2)) {
+        return false;
+    }
+    // Keep the M dim that is unit-stride in C (the column-major GEMM row), and
+    // the N dim nearest it in C (the GEMM column, whose C stride becomes ldc).
+    auto keep_index = [](std::vector<DimSpec> const &c_dims, bool want_unit) -> size_t {
+        size_t best = 0;
+        for (size_t i = 1; i < c_dims.size(); ++i) {
+            if (want_unit ? (c_dims[i].tensor_stride == 1) : (c_dims[i].tensor_stride < c_dims[best].tensor_stride)) {
+                best = i;
+            }
+        }
+        return best;
+    };
+    size_t const keep_m = keep_index(plan.c_m_dims, true);
+    size_t const keep_n = keep_index(plan.c_n_dims, false);
+    if (plan.c_m_dims[keep_m].tensor_stride != 1) {
+        return false;
+    }
+
+    PackingPlan p = plan;
+    p.m_dims      = {plan.m_dims[keep_m]};
+    p.c_m_dims    = {plan.c_m_dims[keep_m]};
+    p.n_dims      = {plan.n_dims[keep_n]};
+    p.c_n_dims    = {plan.c_n_dims[keep_n]};
+    p.M_total     = plan.m_dims[keep_m].size;
+    p.N_total     = plan.n_dims[keep_n].size;
+    p.coalesced   = true; // tensor_pos no longer describes a full M/N group
+    for (size_t i = 0; i < plan.m_dims.size(); ++i) {
+        if (i != keep_m) {
+            p.batch_dims.push_back(BatchDimSpec{plan.m_dims[i].size, plan.m_dims[i].tensor_pos, kSyntheticDimPos, plan.c_m_dims[i].tensor_pos,
+                                                plan.m_dims[i].tensor_stride, 0, plan.c_m_dims[i].tensor_stride});
+            p.batch_total *= plan.m_dims[i].size;
+        }
+    }
+    for (size_t i = 0; i < plan.n_dims.size(); ++i) {
+        if (i != keep_n) {
+            p.batch_dims.push_back(BatchDimSpec{plan.n_dims[i].size, kSyntheticDimPos, plan.n_dims[i].tensor_pos, plan.c_n_dims[i].tensor_pos,
+                                                0, plan.n_dims[i].tensor_stride, plan.c_n_dims[i].tensor_stride});
+            p.batch_total *= plan.n_dims[i].size;
+        }
+    }
+
+    // The gemm_batch path's stride requirements (column-major C, m unit-stride
+    // in C): A is 'N' with m unit-stride or 'T' with k unit-stride, and B is 'N'
+    // with k unit-stride or 'T' with n unit-stride.
+    bool const a_ok = p.m_dims[0].tensor_stride == 1 || p.k_dims_in_a[0].tensor_stride == 1;
+    bool const b_ok = p.k_dims_in_b[0].tensor_stride == 1 || p.n_dims[0].tensor_stride == 1;
+    // Each slice must still be a GEMM worth a vendor call: a promoted plan of
+    // thousands of sliver GEMMs is better left to the packed kernels, which
+    // tile across the whole multi-dim group.
+    if (!a_ok || !b_ok || p.batch_total < 2 || p.M_total < 32) {
+        return false;
+    }
+    out = std::move(p);
+    return true;
+}
+
 /// @brief Execute a tensor contraction via Pack-A / Pack-B + BLAS GEMM tiles (BLIS-style).
 ///
 /// For multi-K contractions (rank-3+), flattens A and B into contiguous M*K / K*N buffers
@@ -479,6 +552,14 @@ template <typename ValueType, einsums::BasicTensorConcept CType, einsums::BasicT
 void blis_contraction(PackingPlan const &plan, CType &C, AType const &A, BType const &B, ValueType alpha, ValueType beta,
                       bool conj_a = false, bool conj_b = false, bool prefer_packed = false) {
     LabeledSection0();
+
+    if (!conj_a && !conj_b) {
+        PackingPlan promoted;
+        if (batch_promoted_plan(plan, promoted)) {
+            blis_contraction<ValueType>(promoted, C, A, B, alpha, beta, conj_a, conj_b, prefer_packed);
+            return;
+        }
+    }
 
     // Resolve the SIMD-dispatch rung's tile kernel and its register-block
     // shape once per contraction; the per-tile call below is through this
