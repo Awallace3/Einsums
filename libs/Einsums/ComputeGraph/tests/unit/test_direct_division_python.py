@@ -131,3 +131,14 @@ def test_direct_division_reciprocal_denominator(dtype):
 
     Dref = eo[i] + eo[j] - ev[:, None] - ev[None, :]
     assert_close(np.asarray(T), np.asarray(K) / Dref)
+
+
+def test_direct_division_beta_zero_does_not_read_c():
+    # beta == 0 must overwrite C, as BLAS does; 0 * NaN would otherwise survive.
+    A = einsums.create_random_tensor("A", [50, 40])
+    B = einsums.create_random_tensor("B", [50, 40])
+    np.asarray(B)[...] += 2.0
+    C = einsums.create_zero_tensor("C", [50, 40])
+    np.asarray(C)[...] = np.nan
+    einsums.linalg.direct_division(1.0, A, B, 0.0, C)
+    np.testing.assert_allclose(np.asarray(C), np.asarray(A) / np.asarray(B), rtol=1e-14)
