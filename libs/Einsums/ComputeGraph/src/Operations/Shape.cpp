@@ -13,6 +13,7 @@
 #include <Einsums/Profile.hpp>
 
 #include <complex>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 
@@ -110,16 +111,73 @@ void run_outer_sum(Impl<T> &r, std::vector<Impl<T> const *> const &vecs, std::ve
         dims[k]    = r.dim(k);
         strides[k] = r.stride(k);
     }
-    T *out = r.data();
-    for_each_index(dims, [&](std::vector<size_t> const &idx) {
-        T sum{};
-        // Each vector through its own stride: a row of a column-major matrix is a vector whose
-        // elements are a matrix height apart, and reading it as contiguous took the wrong ones.
-        for (size_t k = 0; k < N; ++k) {
-            sum += coeffs[k] * vecs[k]->data()[idx[k] * vecs[k]->stride(0)];
+    size_t const total = r.size();
+    if (N == 0 || total == 0) {
+        return;
+    }
+    // Scale each vector once, reading it through its own stride: a row of a column-major matrix
+    // is a vector whose elements are a matrix height apart, and reading it as contiguous took the
+    // wrong ones. data() and stride() are hoisted out of the element loop.
+    std::vector<std::vector<T>> scaled(N);
+    for (size_t k = 0; k < N; ++k) {
+        T const     *v  = vecs[k]->data();
+        size_t const vs = vecs[k]->stride(0);
+        scaled[k].resize(dims[k]);
+        for (size_t i = 0; i < dims[k]; ++i) {
+            scaled[k][i] = coeffs[k] * v[i * vs];
         }
-        out[offset_of(idx, strides)] = sum;
-    });
+    }
+    T *const       out   = r.data();
+    size_t const   n0    = dims[0];
+    size_t const   s0    = strides[0];
+    T const *const v0    = scaled[0].data();
+    auto const     outer = static_cast<std::int64_t>(total / n0);
+
+    // Axis 0 is the inner loop (unit stride for a column-major result); the remaining axes are
+    // flattened and split across threads, each outer point writing a disjoint run of the output.
+    // Terms are added in axis order, ((v0 + v1) + v2) + ..., the association of the
+    // element-at-a-time loop, so results are bitwise unchanged.
+#pragma omp parallel for schedule(static) if (total >= (size_t{1} << 16) && !omp_in_parallel())
+    for (std::int64_t o = 0; o < outer; ++o) {
+        constexpr size_t    kMaxTerms = 8;
+        T                   terms[kMaxTerms]{};
+        size_t              offset = 0;
+        auto                rem    = static_cast<size_t>(o);
+        std::vector<size_t> ix;
+        if (N > kMaxTerms) {
+            ix.assign(N, 0);
+        }
+        for (size_t k = 1; k < N; ++k) {
+            size_t const i = rem % dims[k];
+            rem /= dims[k];
+            if (k < kMaxTerms) {
+                terms[k] = scaled[k][i];
+            } else {
+                ix[k] = i;
+            }
+            offset += i * strides[k];
+        }
+        T *const dst = out + offset;
+        if (N <= kMaxTerms && s0 == 1) {
+#pragma omp simd
+            for (size_t i = 0; i < n0; ++i) {
+                T acc = v0[i];
+                for (size_t k = 1; k < N; ++k) {
+                    acc += terms[k];
+                }
+                dst[i] = acc;
+            }
+        } else {
+            // Rank above kMaxTerms or a strided axis 0: same order, one element at a time.
+            for (size_t i = 0; i < n0; ++i) {
+                T acc = v0[i];
+                for (size_t k = 1; k < N; ++k) {
+                    acc += k < kMaxTerms ? terms[k] : scaled[k][ix[k]];
+                }
+                dst[i * s0] = acc;
+            }
+        }
+    }
 }
 } // namespace
 
