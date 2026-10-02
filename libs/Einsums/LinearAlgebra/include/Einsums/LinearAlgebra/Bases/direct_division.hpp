@@ -35,7 +35,16 @@ void impl_direct_division_contiguous(CType alpha, einsums::detail::TensorImpl<AT
 
     size_t const inca = a.get_incx(), incb = b.get_incx(), incc = c->get_incx(), elems = a.size();
 
-    EINSUMS_OMP_PARALLEL_FOR_SIMD_IF(elems >= ::einsums::hardware::omp_min_parallel_elements())
+    bool const par = elems >= ::einsums::hardware::omp_min_parallel_elements();
+    // beta == 0 overwrites C without reading it, as BLAS does: 0 * NaN is NaN.
+    if (beta == CType{0}) {
+        EINSUMS_OMP_PARALLEL_FOR_SIMD_IF(par)
+        for (size_t i = 0; i < elems; i++) {
+            c_data[i * incc] = alpha * a_data[i * inca] / b_data[i * incb];
+        }
+        return;
+    }
+    EINSUMS_OMP_PARALLEL_FOR_SIMD_IF(par)
     for (size_t i = 0; i < elems; i++) {
         c_data[i * incc] = c_data[i * incc] * beta + alpha * a_data[i * inca] / b_data[i * incb];
     }
@@ -47,7 +56,15 @@ void impl_direct_division_noncontiguous_vectorable(int depth, int hard_rank, siz
                                                    BStrides const &b_strides, size_t incb, CType beta, CType *c_data,
                                                    CStrides const &c_strides, size_t incc) {
     if (depth == hard_rank) {
-        EINSUMS_OMP_PARALLEL_FOR_SIMD_IF(easy_size >= ::einsums::hardware::omp_min_parallel_elements())
+        bool const par = easy_size >= ::einsums::hardware::omp_min_parallel_elements();
+        if (beta == CType{0}) {
+            EINSUMS_OMP_PARALLEL_FOR_SIMD_IF(par)
+            for (size_t i = 0; i < easy_size; i++) {
+                c_data[i * incc] = alpha * a_data[i * inca] / b_data[i * incb];
+            }
+            return;
+        }
+        EINSUMS_OMP_PARALLEL_FOR_SIMD_IF(par)
         for (size_t i = 0; i < easy_size; i++) {
             c_data[i * incc] = c_data[i * incc] * beta + alpha * a_data[i * inca] / b_data[i * incb];
         }
@@ -65,7 +82,7 @@ void impl_direct_division_noncontiguous(int depth, int rank, HardDims const &dim
                                         AStrides const &a_strides, BType const *b_data, BStrides const &b_strides, CType beta,
                                         CType *c_data, CStrides const &c_strides) {
     if (depth == rank) {
-        *c_data = beta * *c_data + alpha * *a_data / *b_data;
+        *c_data = (beta == CType{0}) ? alpha * *a_data / *b_data : beta * *c_data + alpha * *a_data / *b_data;
     } else {
         for (int i = 0; i < dims[depth]; i++) {
             impl_direct_division_noncontiguous(depth + 1, rank, dims, alpha, a_data + i * a_strides[depth], a_strides,
