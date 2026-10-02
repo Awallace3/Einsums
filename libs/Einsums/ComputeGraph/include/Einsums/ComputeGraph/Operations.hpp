@@ -3245,28 +3245,75 @@ void outer_sum(ResultType *result, std::vector<VectorType const *> vectors, std:
                                         vecs[k]->dim(0), k, r->dim(k));
             }
         }
-        size_t const        total = r->size();
-        std::vector<size_t> idx(N, 0);
-        std::vector<size_t> dims(N), strides(N);
+        size_t const total = r->size();
+        if (total == 0) {
+            return;
+        }
+        // Scale each vector once, reading it through its own stride: a view
+        // such as E[1] of a row-major matrix is not unit-stride. data() and
+        // stride() are virtual, so they are hoisted out of the element loop.
+        std::vector<std::vector<T>> scaled(N);
+        std::vector<size_t>         dims(N), strides(N);
         for (size_t k = 0; k < N; ++k) {
             dims[k]    = r->dim(k);
             strides[k] = r->stride(k);
+            auto const *v  = vecs[k]->data();
+            size_t const vs = vecs[k]->stride(0);
+            scaled[k].resize(dims[k]);
+            for (size_t i = 0; i < dims[k]; ++i)
+                scaled[k][i] = effective_coeffs[k] * v[i * vs];
         }
-        T *out = r->data();
-        for (size_t count = 0; count < total; ++count) {
-            T sum{};
-            for (size_t k = 0; k < N; ++k) {
-                sum += effective_coeffs[k] * vecs[k]->data()[idx[k]];
-            }
+        T *const       out   = r->data();
+        size_t const   n0    = dims[0];
+        size_t const   s0    = strides[0];
+        T const *const v0    = scaled[0].data();
+        auto const     outer = static_cast<int64_t>(total / n0);
+
+        // Axis 0 is the inner loop (unit stride for a column-major result);
+        // the remaining axes are flattened and split across threads. Each
+        // outer point writes a disjoint run of the output.
+#ifdef _OPENMP
+#    pragma omp parallel for schedule(static) if (total >= (size_t{1} << 16))
+#endif
+        for (int64_t o = 0; o < outer; ++o) {
+            // Terms are added in axis order, ((v0 + v1) + v2) + ..., the same
+            // association the element-at-a-time loop used, so results are
+            // bitwise unchanged.
+            T      terms[8];
             size_t offset = 0;
-            for (size_t k = 0; k < N; ++k)
-                offset += idx[k] * strides[k];
-            out[offset] = sum;
-            // Increment multi-index (axis 0 fastest, direction is irrelevant for correctness).
-            for (size_t k = 0; k < N; ++k) {
-                if (++idx[k] < dims[k])
-                    break;
-                idx[k] = 0;
+            auto   rem    = static_cast<size_t>(o);
+            for (size_t k = 1; k < N; ++k) {
+                size_t const i = rem % dims[k];
+                rem /= dims[k];
+                if (k < 8)
+                    terms[k] = scaled[k][i];
+                offset += i * strides[k];
+            }
+            T *const dst = out + offset;
+            if (N <= 8 && s0 == 1) {
+#ifdef _OPENMP
+#    pragma omp simd
+#endif
+                for (size_t i = 0; i < n0; ++i) {
+                    T acc = v0[i];
+                    for (size_t k = 1; k < N; ++k)
+                        acc += terms[k];
+                    dst[i] = acc;
+                }
+            } else {
+                // Rank > 8 or a strided axis 0: same order, one element at a time.
+                size_t idx_rem = static_cast<size_t>(o);
+                std::vector<size_t> ix(N, 0);
+                for (size_t k = 1; k < N; ++k) {
+                    ix[k] = idx_rem % dims[k];
+                    idx_rem /= dims[k];
+                }
+                for (size_t i = 0; i < n0; ++i) {
+                    T acc = v0[i];
+                    for (size_t k = 1; k < N; ++k)
+                        acc += scaled[k][ix[k]];
+                    dst[i * s0] = acc;
+                }
             }
         }
     };

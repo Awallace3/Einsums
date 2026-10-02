@@ -292,3 +292,43 @@ def test_outer_sum_VV_then_element_transform_full_mp2_weight():
     expected_delta = eo[:, None, None, None] + eo[None, :, None, None] - ev[None, None, :, None] - ev[None, None, None, :]
     expected = 1.0 / expected_delta
     np.testing.assert_allclose(np.asarray(inv_delta), expected, rtol=1e-5)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Strided vectors, summation order, and the threaded size
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_outer_sum_strided_vector_view():
+    # A row of a column-major matrix is a stride-3 view. The kernel used to
+    # read vecs[k]->data()[i] and so ignored that stride.
+    E = einsums.create_zero_tensor("E", [3, 4])
+    np.asarray(E)[...] = np.arange(12.0).reshape(3, 4)
+    row = E[1]
+    r = einsums.create_zero_tensor("r", [4])
+    einsums.linalg.outer_sum(r, [row], [1.0])
+    np.testing.assert_array_equal(np.asarray(r), [4.0, 5.0, 6.0, 7.0])
+
+
+def test_outer_sum_rank4_bitwise_axis_order_and_threaded():
+    # 64 x 9 x 50 x 9 = 259200 elements: above the OpenMP threshold. Terms are
+    # summed in axis order, ((v0 + v1) + v2) + v3, which must match bitwise.
+    vs_np = [np.random.default_rng(k).standard_normal(n) for k, n in enumerate((64, 9, 50, 9))]
+    cs = [1.0, -1.0, 1.0, -1.0]
+    vs = [einsums.asarray(v, name=f"v{k}") for k, v in enumerate(vs_np)]
+    r = einsums.create_zero_tensor("r", [64, 9, 50, 9])
+    einsums.linalg.outer_sum(r, vs, cs)
+    t = [c * v for c, v in zip(cs, vs_np)]
+    expected = ((t[0][:, None, None, None] + t[1][None, :, None, None]) + t[2][None, None, :, None]) + t[3][None, None, None, :]
+    np.testing.assert_array_equal(np.asarray(r), expected)
+
+
+def test_outer_sum_into_sliced_result_view():
+    R = einsums.create_zero_tensor("R", [8, 5])
+    np.asarray(R)[...] = -7.0
+    a = einsums.asarray(np.arange(4.0), name="a")
+    b = einsums.asarray(10.0 * np.arange(5.0), name="b")
+    einsums.linalg.outer_sum(R[2:6, :], [a, b], [1.0, 1.0])
+    full = np.full((8, 5), -7.0)
+    full[2:6] = np.arange(4.0)[:, None] + 10.0 * np.arange(5.0)[None, :]
+    np.testing.assert_array_equal(np.asarray(R), full)
