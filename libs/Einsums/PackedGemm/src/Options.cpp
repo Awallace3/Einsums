@@ -15,6 +15,7 @@ int register_Einsums_PackedGemm_options() {
     cl::register_option(option::PackedGemmCoresPerL3);
     cl::register_option(option::PackedGemmCTempBudget);
     cl::register_option(option::PackedGemmDumpPlan);
+    cl::register_option(option::PackedGemmBatchPromotion);
     return 0;
 }
 

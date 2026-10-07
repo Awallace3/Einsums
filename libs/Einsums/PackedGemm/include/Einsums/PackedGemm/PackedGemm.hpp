@@ -845,6 +845,18 @@ inline bool batch_promoted_plan(PackingPlan const &plan, PackingPlan &out) {
     return true;
 }
 
+/// Whether a promoted plan (@ref batch_promoted_plan) should run as its gemm_batch under the
+/// default batch-promotion mode.  The batch is an OpenMP loop of serial vendor GEMMs; the packed
+/// engine tiles the whole multi-dim group but scatters into C, which costs it the most when each
+/// slice's GEMM is thin.  Timed on "mcs <- mbs ; bc" over M 96-3744, b = c 16-256 and s 8-64
+/// (streamed operands, median of 3, the modes interleaved), the batch wins up to b = c = 128
+/// threaded and up to 32 on one thread. Geomean over that grid against the faster route per shape,
+/// this rule is 1.068 at 24 threads (never promoting 1.156, always 1.088) and 1.007 on one.
+inline bool batch_promotion_wins(PackingPlan const &promoted) {
+    int64_t const thin = omp_get_max_threads() > 1 ? 128 : 32;
+    return promoted.K_total <= thin && promoted.N_total <= thin;
+}
+
 /// @brief Execute a tensor contraction with the packed engine: the vendor fast paths when the plan
 /// maps onto one GEMM or a batch of them, and otherwise BLIS-style packed loops over the resolved
 /// SIMD rung's tile kernel.
@@ -853,9 +865,16 @@ void blis_contraction(PackingPlan const &plan, CType &C, AType const &A, BType c
                       bool conj_a = false, bool conj_b = false, bool prefer_packed = false) {
     WAGGLE_ZONE_FUNC();
 
-    if (!conj_a && !conj_b) {
+    if (std::int64_t const promote = config::get(option::PackedGemmBatchPromotion); !conj_a && !conj_b && promote >= 0) {
         PackingPlan promoted;
-        if (batch_promoted_plan(plan, promoted)) {
+        bool const  qualifies = batch_promoted_plan(plan, promoted);
+        bool const  take      = qualifies && (promote == 1 || batch_promotion_wins(promoted));
+        if (config::get(option::PackedGemmDumpPlan)) {
+            fmt::print(stderr, "[batch promotion] mode={} qualifies={} taken={} M={} N={} K={} batch={}\n", promote, qualifies, take,
+                       qualifies ? promoted.M_total : plan.M_total, qualifies ? promoted.N_total : plan.N_total, plan.K_total,
+                       qualifies ? promoted.batch_total : plan.batch_total);
+        }
+        if (take) {
             blis_contraction<ValueType>(promoted, C, A, B, alpha, beta, conj_a, conj_b, prefer_packed);
             return;
         }

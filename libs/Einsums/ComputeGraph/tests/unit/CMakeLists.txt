@@ -176,6 +176,7 @@ set(ComputeGraphTests
     test_direct_product_views_python.py
     test_einsum_conj_passes_python.py
     test_einsum_conj_properties_python.py
+    test_einsum_batch_promotion_python.py
     test_einsum_python.py
     test_einsum_views_python.py
     test_element_transform_python.py
