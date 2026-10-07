@@ -318,3 +318,30 @@ def test_outer_sum_reads_strided_vectors_through_their_stride(capture, dtype):
         einsums.linalg.outer_sum(R, rows, [1.0, 2.0])
 
     assert_close(np.asarray(R), m[1, :][:, None] + 2.0 * w[0, :][None, :])
+
+
+# Summation order, the threaded size, and a sliced result
+
+
+def test_outer_sum_rank4_bitwise_axis_order_and_threaded():
+    # 64 x 9 x 50 x 9 = 259200 elements: above the OpenMP threshold. Terms are
+    # summed in axis order, ((v0 + v1) + v2) + v3, which must match bitwise.
+    vs_np = [np.random.default_rng(k).standard_normal(n) for k, n in enumerate((64, 9, 50, 9))]
+    cs = [1.0, -1.0, 1.0, -1.0]
+    vs = [einsums.asarray(v, name=f"v{k}") for k, v in enumerate(vs_np)]
+    r = einsums.create_zero_tensor("r", [64, 9, 50, 9])
+    einsums.linalg.outer_sum(r, vs, cs)
+    t = [c * v for c, v in zip(cs, vs_np)]
+    expected = ((t[0][:, None, None, None] + t[1][None, :, None, None]) + t[2][None, None, :, None]) + t[3][None, None, None, :]
+    np.testing.assert_array_equal(np.asarray(r), expected)
+
+
+def test_outer_sum_into_sliced_result_view():
+    R = einsums.create_zero_tensor("R", [8, 5])
+    np.asarray(R)[...] = -7.0
+    a = einsums.asarray(np.arange(4.0), name="a")
+    b = einsums.asarray(10.0 * np.arange(5.0), name="b")
+    einsums.linalg.outer_sum(R[2:6, :], [a, b], [1.0, 1.0])
+    full = np.full((8, 5), -7.0)
+    full[2:6] = np.arange(4.0)[:, None] + 10.0 * np.arange(5.0)[None, :]
+    np.testing.assert_array_equal(np.asarray(R), full)

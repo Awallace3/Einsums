@@ -247,6 +247,15 @@
     dimensions and strides of each operand group, the register and cache blocks, and how the result
     is written back. Off by default, and meant for diagnosis.
 
+"einsums:packed-gemm:batch-promotion":
+  added: "2.0.0"
+  body: |
+    Whether a contraction with a target index carried by only one operand, such as
+    ``"mcy <- mby ; bc"``, runs as a vendor ``gemm_batch`` (one GEMM per ``y``) instead of the packed
+    engine's scatter kernels. ``-1`` never promotes, ``1`` always promotes when the plan qualifies,
+    and ``0`` (the default) promotes only when each GEMM is thin enough that the batch is expected
+    to win: ``K`` and ``N`` at most 128 when running threaded, at most 32 on one thread. The choice affects speed only.
+
 "einsums:profile:port":
   added: "2.0.0"
   body: |

@@ -752,6 +752,111 @@ void flush_c_block_transposed(T *C_data, T const *Cb, int64_t mc, int64_t mc_len
     }
 }
 
+/// @brief The plan with every M and N dim but one moved into the batch, when that
+/// makes the contraction a stack of plain vendor GEMMs.
+///
+/// A target index that only one operand carries need not be a GEMM row or
+/// column: it is equally a batch index along which the other operand does not
+/// move, i.e. has batch stride 0.  "mcy <- mby ; bc" is the case that matters -
+/// one small GEMM per y against the same B - and as a two-dim M group (m, y) it
+/// can only go to the scatter-packed kernels, which ran it 3-4x slower than a
+/// loop of vendor GEMMs.  Promoted, it is gemm_batch.
+///
+/// Returns false, leaving @p out untouched, unless the result is single-K,
+/// single-M, single-N and has the strides blis_contraction's gemm_batch fast
+/// path takes; so a promoted plan is only ever used on that path.
+///
+/// A group whose dims are adjacent in their operand ("acb <- dab ; dc": a and b
+/// are one flat run of A) is left to the packed engine, which reads that
+/// operand as one panel and shares it across a thread team; only the scatter
+/// in C is left to it, and promoting would split the run into small GEMMs.
+inline bool batch_promoted_plan(PackingPlan const &plan, PackingPlan &out) {
+    if (plan.synthetic || plan.swap_ab || plan.k_dims_in_a.size() != 1 || plan.m_dims.empty() || plan.n_dims.empty() ||
+        (plan.m_dims.size() < 2 && plan.n_dims.size() < 2)) {
+        return false;
+    }
+    auto flat_in_operand = [](std::vector<DimSpec> const &dims) {
+        for (auto const &x : dims) {
+            for (auto const &y : dims) {
+                if (&x != &y && x.tensor_stride == y.tensor_stride * y.size) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (flat_in_operand(plan.m_dims) || flat_in_operand(plan.n_dims)) {
+        return false;
+    }
+    // Keep the M dim that is unit-stride in C (the column-major GEMM row), and
+    // the N dim nearest it in C (the GEMM column, whose C stride becomes ldc).
+    auto keep_index = [](std::vector<DimSpec> const &c_dims, bool want_unit) -> size_t {
+        size_t best = 0;
+        for (size_t i = 1; i < c_dims.size(); ++i) {
+            if (want_unit ? (c_dims[i].tensor_stride == 1) : (c_dims[i].tensor_stride < c_dims[best].tensor_stride)) {
+                best = i;
+            }
+        }
+        return best;
+    };
+    size_t const keep_m = keep_index(plan.c_m_dims, true);
+    size_t const keep_n = keep_index(plan.c_n_dims, false);
+    if (plan.c_m_dims[keep_m].tensor_stride != 1) {
+        return false;
+    }
+
+    PackingPlan p = plan;
+    p.m_dims      = {plan.m_dims[keep_m]};
+    p.c_m_dims    = {plan.c_m_dims[keep_m]};
+    p.n_dims      = {plan.n_dims[keep_n]};
+    p.c_n_dims    = {plan.c_n_dims[keep_n]};
+    p.M_total     = plan.m_dims[keep_m].size;
+    p.N_total     = plan.n_dims[keep_n].size;
+    p.coalesced   = true; // tensor_pos no longer describes a full M/N group
+    for (size_t i = 0; i < plan.m_dims.size(); ++i) {
+        if (i != keep_m) {
+            p.batch_dims.push_back(BatchDimSpec{plan.m_dims[i].size, plan.m_dims[i].tensor_pos, kSyntheticDimPos,
+                                                plan.c_m_dims[i].tensor_pos, plan.m_dims[i].tensor_stride, 0,
+                                                plan.c_m_dims[i].tensor_stride});
+            p.batch_total *= plan.m_dims[i].size;
+        }
+    }
+    for (size_t i = 0; i < plan.n_dims.size(); ++i) {
+        if (i != keep_n) {
+            p.batch_dims.push_back(BatchDimSpec{plan.n_dims[i].size, kSyntheticDimPos, plan.n_dims[i].tensor_pos,
+                                                plan.c_n_dims[i].tensor_pos, 0, plan.n_dims[i].tensor_stride,
+                                                plan.c_n_dims[i].tensor_stride});
+            p.batch_total *= plan.n_dims[i].size;
+        }
+    }
+
+    // The gemm_batch path's stride requirements (column-major C, m unit-stride
+    // in C): A is 'N' with m unit-stride or 'T' with k unit-stride, and B is 'N'
+    // with k unit-stride or 'T' with n unit-stride.
+    bool const a_ok = p.m_dims[0].tensor_stride == 1 || p.k_dims_in_a[0].tensor_stride == 1;
+    bool const b_ok = p.k_dims_in_b[0].tensor_stride == 1 || p.n_dims[0].tensor_stride == 1;
+    // Each slice must still be a GEMM worth a vendor call: a promoted plan of
+    // thousands of sliver GEMMs is better left to the packed kernels, which
+    // tile across the whole multi-dim group.
+    if (!a_ok || !b_ok || p.batch_total < 2 || p.M_total < 32) {
+        return false;
+    }
+    out = std::move(p);
+    return true;
+}
+
+/// Whether a promoted plan (@ref batch_promoted_plan) should run as its gemm_batch under the
+/// default batch-promotion mode.  The batch is an OpenMP loop of serial vendor GEMMs; the packed
+/// engine tiles the whole multi-dim group but scatters into C, which costs it the most when each
+/// slice's GEMM is thin.  Timed on "mcs <- mbs ; bc" over M 96-3744, b = c 16-256 and s 8-64
+/// (streamed operands, median of 3, the modes interleaved), the batch wins up to b = c = 128
+/// threaded and up to 32 on one thread. Geomean over that grid against the faster route per shape,
+/// this rule is 1.068 at 24 threads (never promoting 1.156, always 1.088) and 1.007 on one.
+inline bool batch_promotion_wins(PackingPlan const &promoted) {
+    int64_t const thin = omp_get_max_threads() > 1 ? 128 : 32;
+    return promoted.K_total <= thin && promoted.N_total <= thin;
+}
+
 /// @brief Execute a tensor contraction with the packed engine: the vendor fast paths when the plan
 /// maps onto one GEMM or a batch of them, and otherwise BLIS-style packed loops over the resolved
 /// SIMD rung's tile kernel.
@@ -759,6 +864,21 @@ template <typename ValueType, einsums::BasicTensorConcept CType, einsums::BasicT
 void blis_contraction(PackingPlan const &plan, CType &C, AType const &A, BType const &B, ValueType alpha, ValueType beta,
                       bool conj_a = false, bool conj_b = false, bool prefer_packed = false) {
     WAGGLE_ZONE_FUNC();
+
+    if (std::int64_t const promote = config::get(option::PackedGemmBatchPromotion); !conj_a && !conj_b && promote >= 0) {
+        PackingPlan promoted;
+        bool const  qualifies = batch_promoted_plan(plan, promoted);
+        bool const  take      = qualifies && (promote == 1 || batch_promotion_wins(promoted));
+        if (config::get(option::PackedGemmDumpPlan)) {
+            fmt::print(stderr, "[batch promotion] mode={} qualifies={} taken={} M={} N={} K={} batch={}\n", promote, qualifies, take,
+                       qualifies ? promoted.M_total : plan.M_total, qualifies ? promoted.N_total : plan.N_total, plan.K_total,
+                       qualifies ? promoted.batch_total : plan.batch_total);
+        }
+        if (take) {
+            blis_contraction<ValueType>(promoted, C, A, B, alpha, beta, conj_a, conj_b, prefer_packed);
+            return;
+        }
+    }
 
     // Resolve the rung's tile kernel and its register-block shape once per contraction, so the
     // panels are packed in the geometry that kernel expects and rung resolution stays out of the
@@ -2524,6 +2644,184 @@ void blis_contraction(PackingPlan const &plan, CType &C, AType const &A, BType c
     } // end batch loop
 }
 
+/// Fused, threaded batch-dot: C[t] = C_pf * C[t] + AB_pf * sum_l A[t,l] * B[t,l],
+/// where every C index appears in both A and B (no M or N indices).
+///
+/// The packed engine runs this shape as one 1x1 GEMM per output element, each
+/// packing two strided K-vectors (a per-element gather, plus a profiler zone
+/// per element in profiling builds). Here the loops are ordered by stride
+/// instead: when a batch index is unit-stride in A and B it becomes the inner
+/// vector loop, accumulated over the link indices; when a link index is
+/// unit-stride the inner loop is a dot product. Threads split the remaining
+/// batch indices, so every output element is owned by one thread.
+///
+/// Returns false (and touches nothing) for anything outside that shape:
+/// repeated indices, indices summed in only one operand, mismatched extents,
+/// or conjugated complex operands.
+template <typename T, einsums::BasicTensorConcept AType, einsums::BasicTensorConcept BType, einsums::BasicTensorConcept CType>
+bool fused_batch_dot(ContractionSpec const &spec, T c_pf, CType *C, T ab_pf, AType const &A, BType const &B) {
+    if constexpr (!std::is_same_v<typename CType::ValueType, T>) {
+        return false;
+    }
+    if constexpr (!std::is_floating_point_v<T>) {
+        if (spec.conj_a || spec.conj_b) {
+            return false; // complex: conjugation is not handled here
+        }
+    }
+    auto const &c_raw = spec.c_indices;
+    auto const &a_raw = spec.a_indices;
+    auto const &b_raw = spec.b_indices;
+    auto        pos   = [](std::vector<std::string> const &v, std::string const &x) -> int {
+        int hit = -1;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (v[i] == x) {
+                if (hit >= 0)
+                    return -2; // repeated index: a diagonal, not this shape
+                hit = static_cast<int>(i);
+            }
+        }
+        return hit;
+    };
+    struct Ax {
+        int64_t n, sa, sb, sc;
+    };
+    std::vector<Ax> bat, lnk;
+    for (auto const &x : c_raw) {
+        int const ic = pos(c_raw, x), ia = pos(a_raw, x), ib = pos(b_raw, x);
+        if (ic < 0 || ia < 0 || ib < 0)
+            return false;
+        auto const n = static_cast<int64_t>(C->dim(ic));
+        if (static_cast<int64_t>(A.dim(ia)) != n || static_cast<int64_t>(B.dim(ib)) != n)
+            return false;
+        bat.push_back({n, static_cast<int64_t>(A.stride(ia)), static_cast<int64_t>(B.stride(ib)), static_cast<int64_t>(C->stride(ic))});
+    }
+    for (auto const &x : a_raw) {
+        if (pos(c_raw, x) >= 0)
+            continue;
+        int const ia = pos(a_raw, x), ib = pos(b_raw, x);
+        if (ia < 0 || ib < 0)
+            return false; // summed in A only, or repeated
+        auto const n = static_cast<int64_t>(A.dim(ia));
+        if (static_cast<int64_t>(B.dim(ib)) != n)
+            return false;
+        lnk.push_back({n, static_cast<int64_t>(A.stride(ia)), static_cast<int64_t>(B.stride(ib)), 0});
+    }
+    if (a_raw.size() != b_raw.size() || bat.size() + lnk.size() != a_raw.size() || bat.empty() || lnk.empty())
+        return false;
+
+    WAGGLE_ZONE("fused batch-dot");
+    WAGGLE_ANNOTATE("packed_gemm_path", "fused_batch_dot");
+
+    T const *const a     = A.data();
+    T const *const b     = B.data();
+    T *const       c     = C->data();
+    auto const     cmp_a = [](Ax const &x, Ax const &y) { return x.sa < y.sa; };
+    std::sort(lnk.begin(), lnk.end(), cmp_a); // fastest link index first: walk A and B in memory order
+
+    int64_t nb_tot = 1, nl_tot = 1;
+    for (auto const &x : bat)
+        nb_tot *= x.n;
+    for (auto const &x : lnk)
+        nl_tot *= x.n;
+    if (nb_tot == 0)
+        return true;
+    bool const par = nb_tot * nl_tot >= (int64_t{1} << 15);
+
+    auto finish = [&](T *dst, T acc) { *dst = (c_pf == T{0}) ? ab_pf * acc : c_pf * *dst + ab_pf * acc; };
+
+    // Inner vector loop over a batch index that is unit-stride in A and B.
+    auto inner_bat = std::find_if(bat.begin(), bat.end(), [](Ax const &x) { return x.sa == 1 && x.sb == 1; });
+    if (inner_bat != bat.end() && !(lnk.front().sa == 1 && lnk.front().sb == 1 && lnk.front().n >= inner_bat->n)) {
+        Ax const v = *inner_bat;
+        bat.erase(inner_bat);
+        int64_t const n_out = nb_tot / v.n;
+#ifdef _OPENMP
+#    pragma omp parallel if (par)
+#endif
+        {
+            std::vector<T> acc(static_cast<size_t>(v.n));
+#ifdef _OPENMP
+#    pragma omp for schedule(static)
+#endif
+            for (int64_t o = 0; o < n_out; ++o) {
+                int64_t oa = 0, ob = 0, oc = 0, rem = o;
+                for (auto const &x : bat) {
+                    int64_t const i = rem % x.n;
+                    rem /= x.n;
+                    oa += i * x.sa;
+                    ob += i * x.sb;
+                    oc += i * x.sc;
+                }
+                std::fill(acc.begin(), acc.end(), T{0});
+                for (int64_t l = 0; l < nl_tot; ++l) {
+                    int64_t la = 0, lb = 0, lr = l;
+                    for (auto const &x : lnk) {
+                        int64_t const i = lr % x.n;
+                        lr /= x.n;
+                        la += i * x.sa;
+                        lb += i * x.sb;
+                    }
+                    T const *pa = a + oa + la;
+                    T const *pb = b + ob + lb;
+                    T       *pc = acc.data();
+#ifdef _OPENMP
+#    pragma omp simd
+#endif
+                    for (int64_t i = 0; i < v.n; ++i)
+                        pc[i] += pa[i] * pb[i];
+                }
+                for (int64_t i = 0; i < v.n; ++i)
+                    finish(c + oc + i * v.sc, acc[static_cast<size_t>(i)]);
+            }
+        }
+        return true;
+    }
+
+    // Otherwise one dot product per output element, innermost over the
+    // fastest link index.
+    Ax const      d   = lnk.front();
+    int64_t const nl2 = nl_tot / d.n;
+#ifdef _OPENMP
+#    pragma omp parallel for schedule(static) if (par)
+#endif
+    for (int64_t o = 0; o < nb_tot; ++o) {
+        int64_t oa = 0, ob = 0, oc = 0, rem = o;
+        for (auto const &x : bat) {
+            int64_t const i = rem % x.n;
+            rem /= x.n;
+            oa += i * x.sa;
+            ob += i * x.sb;
+            oc += i * x.sc;
+        }
+        T acc{0};
+        for (int64_t l = 0; l < nl2; ++l) {
+            int64_t la = 0, lb = 0, lr = l;
+            for (size_t k = 1; k < lnk.size(); ++k) {
+                int64_t const i = lr % lnk[k].n;
+                lr /= lnk[k].n;
+                la += i * lnk[k].sa;
+                lb += i * lnk[k].sb;
+            }
+            T const *pa = a + oa + la;
+            T const *pb = b + ob + lb;
+            T        s{0};
+            if (d.sa == 1 && d.sb == 1) {
+#ifdef _OPENMP
+#    pragma omp simd reduction(+ : s)
+#endif
+                for (int64_t i = 0; i < d.n; ++i)
+                    s += pa[i] * pb[i];
+            } else {
+                for (int64_t i = 0; i < d.n; ++i)
+                    s += pa[i * d.sa] * pb[i * d.sb];
+            }
+            acc += s;
+        }
+        finish(c + oc, acc);
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime entry point: accepts a pre-built ContractionSpec.
 // ---------------------------------------------------------------------------
@@ -2980,6 +3278,15 @@ bool try_packed_gemm(ContractionSpec const &spec_in, einsums::ValueTypeT<CType> 
         // for the eager dispatch whose generic fallback is the good one; runtime callers' fallback
         // is slower than the packed path, so they keep it. A GEMV-shaped contraction gets here only
         // when the gemv and stream routes above declined.
+        // The runtime dispatch has no good generic fallback for batch-dot, so run it fused here
+        // rather than through the packed passes. Not remembered on the site: a hit must come back
+        // here, not to a packed plan.
+        if (allow_scatter && m_count == 0 && n_count == 0 && !link.empty()) {
+            if (fused_batch_dot<ValueType>(spec, static_cast<ValueType>(C_prefactor), C, static_cast<ValueType>(AB_prefactor), A, B)) {
+                last_contraction_route() = "fused_batch_dot";
+                return true;
+            }
+        }
         if (!allow_scatter && m_count == 0 && n_count == 0) {
             WAGGLE_ANNOTATE("packed_gemm_skip", "defer_to_generic_batch_dot");
             remember(key, nullptr);

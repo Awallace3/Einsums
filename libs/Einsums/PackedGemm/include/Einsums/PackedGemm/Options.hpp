@@ -56,6 +56,16 @@ inline constinit cl::ConfigOption<std::int64_t> PackedGemmCTempBudget = cl::conf
 inline constinit cl::ConfigOption<bool> PackedGemmDumpPlan =
     cl::config_flag("einsums:packed-gemm:dump-plan", "Print each packed contraction's plan and blocking to stderr", "PackedGemm", false);
 
+/// Whether a contraction whose M or N group has a dim only one operand carries ("mcy <- mby ; bc")
+/// runs as a vendor gemm_batch, with that dim moved into the batch at stride 0 in the other operand.
+///
+/// -1 never (the packed engine's scatter route), 1 always when the plan qualifies, 0 (the default)
+/// when the batch_promoted_plan heuristic expects the batch to win. Speed only; the result is the
+/// same to rounding.
+inline constinit cl::ConfigOption<std::int64_t> PackedGemmBatchPromotion = cl::config_opt<std::int64_t>(
+    "einsums:packed-gemm:batch-promotion", "Run one-operand M/N dims as a gemm_batch: -1 never, 0 when it should win, 1 always",
+    "PackedGemm", 0, "MODE", cl::RangeBetween<std::int64_t>(-1, 1));
+
 EINSUMS_NAMESPACE_END(option)
 
 EINSUMS_NAMESPACE_BEGIN()

@@ -88,3 +88,65 @@ def test_multi_char_indices_batched(dtype):
 
     expected = np.einsum("bik,bkj->bij", np.asarray(A), np.asarray(B))
     assert_close(np.asarray(C), expected)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Batch-dot: every output index is in both operands (no M or N indices).
+# The runtime dispatch runs these through a fused kernel; cover both of its
+# loop orders (unit-stride batch index inner, unit-stride link index inner),
+# a transposed operand, the C prefactor, and a sliced view.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize(
+    "spec,a_shape,b_shape,np_spec",
+    [
+        ("ab <- arbs ; arbs", [7, 5, 6, 4], [7, 5, 6, 4], "arbs,arbs->ab"),  # batch index a unit-stride
+        ("ab <- rsab ; rsab", [5, 4, 7, 6], [5, 4, 7, 6], "rsab,rsab->ab"),  # link index r unit-stride
+        ("ab <- arbs ; asbr", [7, 5, 6, 4], [7, 4, 6, 5], "arbs,asbr->ab"),  # transposed link map
+        ("ba <- arbs ; arbs", [7, 5, 6, 4], [7, 5, 6, 4], "arbs,arbs->ba"),  # permuted output
+        ("i <- ik ; ik", [9, 11], [9, 11], "ik,ik->i"),
+    ],
+)
+@pytest.mark.parametrize("c_pf", [0.0, 1.0, 0.5])
+def test_batch_dot(dtype, spec, a_shape, b_shape, np_spec, c_pf):
+    A = einsums.create_random_tensor("A", a_shape, dtype=dtype)
+    B = einsums.create_random_tensor("B", b_shape, dtype=dtype)
+    out = np_spec.split("->")[1]
+    dims = {k: n for k, n in zip(np_spec.split(",")[0], a_shape)}
+    C = einsums.create_random_tensor("C", [dims[k] for k in out], dtype=dtype)
+    C0 = np.array(np.asarray(C))
+    einsums.einsum(spec, C, A, B, c_pf=c_pf, ab_pf=-2.0)
+    expected = c_pf * C0 - 2.0 * np.einsum(np_spec, np.asarray(A), np.asarray(B))
+    assert_close(np.asarray(C), expected, dtype=dtype)
+
+
+def test_batch_dot_beta_zero_ignores_nan_in_c():
+    A = einsums.create_random_tensor("A", [7, 5, 6, 4])
+    B = einsums.create_random_tensor("B", [7, 5, 6, 4])
+    C = einsums.create_zero_tensor("C", [7, 6])
+    np.asarray(C)[...] = np.nan
+    einsums.einsum("ab <- arbs ; arbs", C, A, B, c_pf=0.0, ab_pf=1.0)
+    np.testing.assert_allclose(np.asarray(C), np.einsum("arbs,arbs->ab", np.asarray(A), np.asarray(B)), rtol=1e-12)
+
+
+def test_batch_dot_large_threaded():
+    # Large enough to take the threaded branch (fdisp0's protein83 block shape, scaled down).
+    A = einsums.create_random_tensor("A", [40, 12, 30, 12])
+    B = einsums.create_random_tensor("B", [40, 12, 30, 12])
+    C = einsums.create_zero_tensor("C", [40, 30])
+    einsums.einsum("ab <- arbs ; arbs", C, A, B, c_pf=1.0, ab_pf=4.0)
+    np.testing.assert_allclose(
+        np.asarray(C), 4.0 * np.einsum("arbs,arbs->ab", np.asarray(A), np.asarray(B)), rtol=1e-11, atol=1e-11
+    )
+
+
+def test_batch_dot_on_sliced_view():
+    A = einsums.create_random_tensor("A", [9, 5, 6, 4])
+    B = einsums.create_random_tensor("B", [9, 5, 6, 4])
+    C = einsums.create_zero_tensor("C", [5, 6])
+    Av, Bv = A[2:7, :, :, :], B[2:7, :, :, :]
+    einsums.einsum("ab <- arbs ; arbs", C, Av, Bv, c_pf=0.0, ab_pf=1.0)
+    expected = np.einsum("arbs,arbs->ab", np.asarray(A)[2:7], np.asarray(B)[2:7])
+    np.testing.assert_allclose(np.asarray(C), expected, rtol=1e-12)

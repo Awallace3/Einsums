@@ -213,6 +213,31 @@ APIARY_INSTANTIATE_AS("RuntimeTensorZ", GeneralRuntimeTensor<std::complex<double
     }
 
     /**
+     * @brief Move constructor: takes the source's storage block instead of copying it.
+     *
+     * Without one, the user-declared destructor suppresses the implicit move,
+     * and every by-value return that is not elided - including every pybind11
+     * binding that returns a tensor, such as ``create_zero_tensor`` - runs the
+     * deep-copying copy constructor: a second allocation of the full size, a
+     * memcpy, and a peak footprint of twice the tensor.
+     *
+     * The block is shared, so views sliced from the source keep their
+     * reference to it and stay valid, and the generation this wrapper last
+     * synced from travels with it. The liveness token is deliberately NOT
+     * moved: graph capture pairs it with the source object's address, and the
+     * source object still dies on its own schedule. The source is left an
+     * empty, unallocated tensor with a fresh block of its own.
+     */
+    GeneralRuntimeTensor(GeneralRuntimeTensor<T, Alloc> &&other)
+        : _storage{std::move(other._storage)}, _name{std::move(other._name)}, _impl{other._impl}, _seen_generation{other._seen_generation},
+          _aliased{other._aliased}, _symmetry{std::move(other._symmetry)}, _pending_init{other._pending_init} {
+        other._storage         = detail::make_storage_block<T, Vector>();
+        other._impl            = detail::TensorImpl<T>{};
+        other._seen_generation = 0;
+        other._aliased         = false;
+    }
+
+    /**
      * @brief Copy with a different allocator.
      *
      * Handles host↔device transfers automatically when copying between
